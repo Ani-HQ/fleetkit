@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Render fleet.yaml into OpenClaw, Hermes and session-warden config.
+
+Runs on every `./fleet up`, before any gateway starts, and is safe to re-run.
+fleet.yaml owns agents, models, channel accounts, bindings and the warden
+schedule. Files a human is meant to edit (SOUL.md, ROLE.md, HEARTBEAT.md,
+anything outside the managed .env block) are written once, then left alone.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+HOME = Path.home()
+OPENCLAW = HOME / ".openclaw"
+HERMES = HOME / ".hermes"
+SECRETS = Path("/run/fleet-secrets")
+FLEETKIT = Path(os.environ.get("FLEETKIT_HOME", "/opt/fleetkit"))
+WARDEN = Path(os.environ.get("WARDEN_HOME", "/opt/session-warden"))
+FLEET_YAML = Path("/etc/fleetkit/fleet.yaml")
+
+ROLES = {"ops", "builder", "assistant", "researcher", "custom"}
+CHANNELS = {"discord", "telegram", "whatsapp"}
+
+# Subscription models, and the OpenClaw runtime that bills each to the plan
+# instead of an API key.
+MODELS = {
+    "claude": ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4-8"],
+    "chatgpt": ["openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna"],
+}
+RUNTIME = {"anthropic": "claude-cli", "openai": "codex"}
+HERMES_PROVIDER = {"anthropic": "anthropic", "openai": "openai-codex"}
+
+MANAGED_BEGIN = "# >>> fleetkit managed: edit fleet.yaml / .env instead <<<"
+MANAGED_END = "# >>> end fleetkit managed <<<"
+AGENTS_MARKER = "<!-- fleetkit -->"
+
+
+def log(msg):
+    print(f"[fleet-init] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg):
+    log(f"error: {msg}")
+    sys.exit(1)
+
+
+def load_fleet():
+    if not FLEET_YAML.is_file():
+        die(f"{FLEET_YAML} is missing. Run ./fleet setup on the host.")
+    fleet = yaml.safe_load(FLEET_YAML.read_text()) or {}
+    owner = fleet.setdefault("owner", {})
+    owner.setdefault("name", "owner")
+    owner.setdefault("timezone", "UTC")
+
+    subs = fleet.get("subscriptions") or []
+    if not subs or set(subs) - set(MODELS):
+        die("fleet.yaml `subscriptions` must list claude and/or chatgpt")
+
+    seen, whatsapp = set(), {}
+    for agent in fleet.setdefault("agents", []):
+        aid = str(agent.get("id", ""))
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", aid):
+            die(f"agent id {aid!r} must be lowercase letters, digits or dashes")
+        if aid in seen or aid in {"main", "default"}:
+            die(f"agent id {aid!r} is duplicated or reserved")
+        seen.add(aid)
+        agent.setdefault("name", aid.capitalize())
+        agent.setdefault("role", "custom")
+        if agent.get("harness") not in {"openclaw", "hermes"}:
+            die(f"agent {aid}: harness must be openclaw or hermes")
+        if agent["role"] not in ROLES:
+            die(f"agent {aid}: role must be one of {sorted(ROLES)}")
+        chans = agent.setdefault("channels", [])
+        if set(chans) - CHANNELS:
+            die(f"agent {aid}: channels must be from {sorted(CHANNELS)}")
+        if "whatsapp" in chans and whatsapp.setdefault(agent["harness"], aid) != aid:
+            die(f"only one {agent['harness']} agent can own WhatsApp")
+
+    fleet.setdefault("defaults", {})
+    fleet.setdefault("memory", {}).setdefault("enabled", True)
+    fleet.setdefault("warden", {}).setdefault("enabled", True)
+    return fleet
+
+
+def env_name(prefix, aid):
+    return f"{prefix}_{aid.upper().replace('-', '_')}"
+
+
+def model_pool(subs, order):
+    return [m for sub in order if sub in subs for m in MODELS[sub]]
+
+
+def model_chain(agent, subs, order):
+    pool = model_pool(subs, order)
+    primary = agent.get("model") or pool[0]
+    return primary, [m for m in pool if m != primary]
+
+
+def read_secret(name):
+    path = SECRETS / name
+    return path.read_text().strip() if path.is_file() else ""
+
+
+def write_once(path, text):
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+def template(*parts):
+    return (FLEETKIT / "templates" / Path(*parts)).read_text()
+
+
+# ── OpenClaw ────────────────────────────────────────────────────────────────
+
+def openclaw(*args, check=True):
+    res = subprocess.run(["openclaw", *args], capture_output=True, text=True)
+    if check and res.returncode != 0:
+        die(f"openclaw {' '.join(args[:3])} failed:\n{res.stdout}{res.stderr}")
+    return res
+
+
+def env_ref(name):
+    return {"source": "env", "provider": "default", "id": name}
+
+
+def channel_account(chan, aid):
+    """Per-agent bot account for OpenClaw, or None if its token is missing."""
+    if chan == "whatsapp":
+        number = os.environ.get("OWNER_WHATSAPP_NUMBER", "").lstrip("+")
+        account, owner = {}, (f"+{number}" if number else "")
+    else:
+        prefix, field, owner_var = {
+            "discord": ("DISCORD_TOKEN", "token", "OWNER_DISCORD_ID"),
+            "telegram": ("TELEGRAM_TOKEN", "botToken", "OWNER_TELEGRAM_ID"),
+        }[chan]
+        token = env_name(prefix, aid)
+        if not os.environ.get(token):
+            log(f"skip {chan} for {aid}: {token} is empty in .env")
+            return None
+        account, owner = {field: env_ref(token)}, os.environ.get(owner_var, "")
+    if owner:
+        account.update(dmPolicy="allowlist", allowFrom=[owner])
+    else:
+        account["dmPolicy"] = "pairing"
+    return account
+
+
+def seed_workspace(workspace, agent):
+    role = template("roles", f"{agent['role']}.md")
+    write_once(workspace / "ROLE.md", role)
+    hb = workspace / "HEARTBEAT.md"
+    if not hb.exists() or "Keep this file empty" in hb.read_text():
+        hb.write_text("# HEARTBEAT.md\n" + role.split("## Heartbeat checklist", 1)[-1])
+    agents_md = workspace / "AGENTS.md"
+    text = agents_md.read_text() if agents_md.exists() else ""
+    if AGENTS_MARKER in text:
+        return
+    agents_md.write_text(text.rstrip() + f"""
+
+{AGENTS_MARKER}
+## Fleet
+
+You are **{agent['name']}**, one agent in a fleet. At session start, also read:
+
+- `ROLE.md`: what you own in this fleet
+- `~/.openclaw/shared/COMMUNICATION.md`: how to write to humans (every message)
+
+If an `engram` tool is available, it is the fleet's shared memory: `recall`
+before substantial work, `remember` decisions and hand-offs.
+""")
+
+
+def setup_openclaw(fleet):
+    agents = [a for a in fleet["agents"] if a["harness"] == "openclaw"]
+    subs, tz, defaults = fleet["subscriptions"], fleet["owner"]["timezone"], fleet["defaults"]
+
+    if not (OPENCLAW / "openclaw.json").is_file():
+        log("first boot: onboarding OpenClaw")
+        openclaw("onboard", "--non-interactive", "--accept-risk", "--mode", "local",
+                 "--auth-choice", "skip", "--gateway-auth", "token",
+                 "--gateway-token-ref-env", "OPENCLAW_GATEWAY_TOKEN", "--gateway-bind", "lan",
+                 "--skip-health", "--skip-channels", "--skip-daemon", "--skip-search",
+                 "--skip-skills", "--skip-ui", "--skip-hooks")
+
+    config = json.loads((OPENCLAW / "openclaw.json").read_text())
+    existing = config.get("agents", {}).get("entries", {})
+    for agent in agents:
+        workspace = OPENCLAW / "agents" / agent["id"]
+        if agent["id"] not in existing:
+            log(f"adding OpenClaw agent {agent['id']}")
+            openclaw("agents", "add", agent["id"], "--workspace", str(workspace), "--non-interactive")
+        seed_workspace(workspace, agent)
+    write_once(OPENCLAW / "shared" / "COMMUNICATION.md", template("shared", "COMMUNICATION.md"))
+
+    primary, fallbacks = model_chain({}, subs, ["claude", "chatgpt"])
+    ops = [
+        {"path": "gateway.bind", "value": "lan"},
+        {"path": "gateway.controlUi.allowedOrigins",
+         "value": ["http://localhost:18789", "http://127.0.0.1:18789"]},
+        {"path": "agents.defaults.models",
+         "value": {m: {"agentRuntime": {"id": RUNTIME[m.split("/")[0]]}}
+                   for m in model_pool(subs, ["claude", "chatgpt"])}},
+        {"path": "agents.defaults.model", "value": {"primary": primary, "fallbacks": fallbacks}},
+    ]
+
+    bindings, enabled = [], set()
+    for agent in agents:
+        aid = agent["id"]
+        order = ["chatgpt", "claude"] if agent["role"] == "builder" else ["claude", "chatgpt"]
+        primary, fallbacks = model_chain(agent, subs, order)
+        heartbeat = {"every": str(defaults.get("heartbeat", "1h"))}
+        if defaults.get("active_hours"):
+            hours = defaults["active_hours"]
+            heartbeat["activeHours"] = {"start": hours["start"], "end": hours["end"], "timezone": tz}
+        ops += [
+            {"path": f"agents.entries.{aid}.name", "value": agent["name"]},
+            {"path": f"agents.entries.{aid}.identity.name", "value": agent["name"]},
+            {"path": f"agents.entries.{aid}.model", "value": {"primary": primary, "fallbacks": fallbacks}},
+            {"path": f"agents.entries.{aid}.heartbeat", "value": heartbeat},
+        ]
+        for chan in agent["channels"]:
+            account = channel_account(chan, aid)
+            if account is None:
+                continue
+            enabled.add(chan)
+            ops += [{"path": f"channels.{chan}.accounts.{aid}.{k}", "value": v} for k, v in account.items()]
+            bindings.append({"type": "route", "agentId": aid, "match": {"channel": chan, "accountId": aid}})
+
+    ops += [{"path": f"channels.{chan}.enabled", "value": True} for chan in sorted(enabled)]
+    if "discord" in enabled:
+        ops.append({"path": "channels.discord.groupPolicy", "value": "open"})
+    ops.append({"path": "bindings", "value": bindings})
+    # Built-in semantic search needs an embeddings API key; subscriptions-only fleets use engram.
+    ops.append({"path": "memory.search.enabled", "value": False})
+
+    if fleet["memory"]["enabled"]:
+        ops.append({"path": "mcp.servers.engram", "value": {"command": "fleet-engram-mcp"}})
+    elif "engram" in config.get("mcp", {}).get("servers", {}):
+        openclaw("config", "unset", "mcp.servers.engram", check=False)
+
+    if "whatsapp" in enabled and not (OPENCLAW / "extensions" / "whatsapp").exists():
+        log("installing the OpenClaw WhatsApp plugin")
+        openclaw("plugins", "install", "@openclaw/whatsapp", check=False)
+
+    openclaw("config", "set", "--batch-json", json.dumps(ops))
+    openclaw("config", "validate")
+    log(f"OpenClaw: {len(agents)} agent(s), {len(bindings)} channel binding(s)")
+
+
+# ── Hermes ──────────────────────────────────────────────────────────────────
+
+def hermes_agents(fleet):
+    return [a for a in fleet["agents"] if a["harness"] == "hermes"]
+
+
+def hermes_home(index, agent):
+    """The first Hermes agent is the default profile; the rest are named profiles."""
+    return HERMES if index == 0 else HERMES / "profiles" / agent["id"]
+
+
+def hermes_model(model):
+    provider, _, name = model.partition("/")
+    return HERMES_PROVIDER[provider], name
+
+
+def write_managed_env(path, values):
+    """Replace only the fleetkit block; keep anything a human added."""
+    text = path.read_text() if path.exists() else ""
+    block = re.compile(re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?", re.S)
+    body = "\n".join(f"{k}={v}" for k, v in values.items() if v)
+    text = f"{block.sub('', text).rstrip()}\n\n{MANAGED_BEGIN}\n{body}\n{MANAGED_END}\n".lstrip()
+    path.write_text(text)
+    path.chmod(0o600)
+
+
+def setup_hermes(fleet):
+    subs = fleet["subscriptions"]
+    engram_token = read_secret("engram/hermes.token") if fleet["memory"]["enabled"] else ""
+    claude_token = read_secret("claude-oauth-token")
+
+    for index, agent in enumerate(hermes_agents(fleet)):
+        aid, home = agent["id"], hermes_home(index, agent)
+        home.mkdir(parents=True, exist_ok=True)
+
+        # Hermes bills Claude only to Max plans with extra usage credits, so
+        # it leads with ChatGPT when both subscriptions are connected.
+        primary, fallbacks = model_chain(agent, subs, ["chatgpt", "claude"])
+        provider, name = hermes_model(primary)
+        cfg_path = home / "config.yaml"
+        cfg = (yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else None) or {}
+        cfg["model"] = {**(cfg.get("model") or {}), "default": name, "provider": provider}
+        cfg["fallback_providers"] = [dict(zip(("provider", "model"), hermes_model(m)))
+                                     for m in fallbacks[:2]]
+        cfg["timezone"] = fleet["owner"]["timezone"]
+        servers = cfg.get("mcp_servers") or {}
+        if engram_token:
+            servers["engram"] = {"url": "http://engram:8080/mcp",
+                                 "headers": {"Authorization": "Bearer ${ENGRAM_TOKEN}"}}
+        else:
+            servers.pop("engram", None)
+        cfg["mcp_servers"] = servers
+        if index == 0:
+            cfg.setdefault("gateway", {})["multiplex_profiles"] = True
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+        write_once(home / "SOUL.md", f"# {agent['name']}\n\n{template('roles', agent['role'] + '.md')}\n"
+                                     f"{template('shared', 'COMMUNICATION.md')}")
+
+        env, chans = {}, agent["channels"]
+        for chan, prefix, owner_var in [("telegram", "TELEGRAM", "OWNER_TELEGRAM_ID"),
+                                        ("discord", "DISCORD", "OWNER_DISCORD_ID")]:
+            if chan not in chans:
+                continue
+            token = os.environ.get(env_name(f"{prefix}_TOKEN", aid), "")
+            if not token:
+                log(f"skip {chan} for {aid}: {env_name(prefix + '_TOKEN', aid)} is empty in .env")
+                continue
+            env[f"{prefix}_BOT_TOKEN"] = token
+            env[f"{prefix}_ALLOWED_USERS"] = os.environ.get(owner_var, "")
+        if "whatsapp" in chans:
+            env.update(WHATSAPP_ENABLED="true", WHATSAPP_MODE="bot",
+                       WHATSAPP_ALLOWED_USERS=os.environ.get("OWNER_WHATSAPP_NUMBER", "").lstrip("+"))
+        env["ENGRAM_TOKEN"] = engram_token
+        if "claude" in subs:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
+        write_managed_env(home / ".env", env)
+
+    log(f"Hermes: {len(hermes_agents(fleet))} profile(s)")
+
+
+def link_hermes_homes(fleet):
+    """session-warden looks for Hermes agents at ~/.hermes-<id>."""
+    for index, agent in enumerate(hermes_agents(fleet)):
+        link = HOME / f".hermes-{agent['id']}"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(hermes_home(index, agent))
+
+
+# ── session-warden ──────────────────────────────────────────────────────────
+
+CRON = """\
+# Generated by fleet-init from fleet.yaml. Times are in {tz}.
+*/2 * * * *  {w}/bin/rate-guard.sh --once
+*/30 * * * * {w}/bin/snapshot.sh
+30 3 * * *   {w}/bin/dream-cycle.sh
+10 4 * * *   {w}/bin/reflect.sh
+30 6 * * 6   {w}/bin/fleet-review.sh
+0 5 * * 0    {w}/bin/harvest-skills.sh
+0 7 1 * *    {w}/bin/eval-memory.sh
+*/10 * * * * FLEET_OUT=/var/lib/fleet-board {w}/contrib/fleet-live/generate.sh
+"""
+
+
+def setup_warden(fleet):
+    crontab = OPENCLAW / "fleetkit" / "crontab"
+    crontab.parent.mkdir(parents=True, exist_ok=True)
+    if not fleet["warden"]["enabled"]:
+        crontab.unlink(missing_ok=True)
+        log("session-warden: off")
+        return
+
+    config = WARDEN / "state" / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    for src in (WARDEN / "config.dist").iterdir():
+        dest = config / src.name.removesuffix(".example")
+        if dest.exists():
+            continue
+        (shutil.copytree if src.is_dir() else shutil.copy)(src, dest)
+
+    thresholds = config / "thresholds.env"
+    if thresholds.exists():
+        text = thresholds.read_text()
+        for key in ("WARDEN_TELEGRAM_BOT_TOKEN", "WARDEN_TELEGRAM_CHAT_ID"):
+            text = re.sub(rf"^{key}=$", f"{key}=${{{key}:-}}", text, flags=re.M)
+        thresholds.write_text(text)
+
+    rows = ["# Generated by fleet-init from fleet.yaml",
+            "# agent\tteam\tchannel\trole\tboard\ttitle\tblurb"]
+    for agent in fleet["agents"]:
+        if agent["harness"] == "openclaw":
+            chan = (agent["channels"] or ["internal"])[0]
+            rows.append("\t".join([agent["id"], "fleet", chan, agent["role"], "1",
+                                   agent["name"], f"{agent['role']} agent"]))
+    (config / "fleet-roster.tsv").write_text("\n".join(rows) + "\n")
+
+    cron = CRON.format(tz=fleet["owner"]["timezone"], w=WARDEN)
+    if hermes_agents(fleet):
+        cron += f"0 6 * * 6    {WARDEN}/bin/scorecard.sh\n"
+    crontab.write_text(cron)
+    log("session-warden: schedule written")
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def write_fleet_env(fleet):
+    values = {
+        "FLEET_TZ": fleet["owner"]["timezone"],
+        "WARDEN_SCORECARD_AGENTS": " ".join(a["id"] for a in hermes_agents(fleet)),
+        "CLAUDE_CODE_OAUTH_TOKEN": read_secret("claude-oauth-token"),
+    }
+    path = SECRETS / "fleet.env"
+    path.write_text("".join(f"{k}={json.dumps(v)}\n" for k, v in values.items() if v))
+    path.chmod(0o600)
+
+
+def main():
+    fleet = load_fleet()
+    if "--links-only" in sys.argv:
+        link_hermes_homes(fleet)
+        return
+    write_fleet_env(fleet)
+    setup_openclaw(fleet)
+    setup_hermes(fleet)
+    link_hermes_homes(fleet)
+    setup_warden(fleet)
+    log("done")
+
+
+if __name__ == "__main__":
+    main()

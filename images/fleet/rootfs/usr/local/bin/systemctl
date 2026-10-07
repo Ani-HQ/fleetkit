@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Containers have no systemd. session-warden asks systemd to restart gateways
+# after it edits their config; OpenClaw and Hermes both reload config on their
+# own, so log the request and report success.
+printf '[fleet] systemctl %s: no systemd in container, config hot-reload applies\n' "$*" >&2
+case " $* " in
+  *" is-active "*) echo active ;;
+esac
+exit 0
