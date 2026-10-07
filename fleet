@@ -9,7 +9,13 @@ info() { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 die() { printf 'fleet: %s\n' "$*" >&2; exit 1; }
 
-compose() { docker compose "$@"; }
+compose() {
+  if [ -f .env ] && grep -q '^TS_AUTHKEY=.' .env; then
+    docker compose -f docker-compose.yml -f docker-compose.tailscale.yml "$@"
+  else
+    docker compose "$@"
+  fi
+}
 
 need_setup() {
   [ -f .env ] && [ -f fleet.yaml ] || die "run ./fleet setup first"
@@ -36,6 +42,13 @@ if q == 'hermes':
 elif q.startswith('harness:'):
     aid = q.split(':', 1)[1]
     print(next((a.get('harness', '') for a in agents if a['id'] == aid), ''))
+elif q.startswith('person:'):
+    pid = q.split(':', 1)[1]
+    print(next((p.get('name', '') for p in f.get('people') or [] if p.get('id') == pid), ''))
+elif q.startswith('personid:'):
+    _, pid, chan = q.split(':', 2)
+    p = next((p for p in f.get('people') or [] if p.get('id') == pid), {})
+    print(str(p.get(chan) or '').lstrip('+'))
 " "$1"
 }
 
@@ -107,7 +120,7 @@ cmd_setup() {
     ops_ch=$(ask "Ops agent channel (discord/telegram/whatsapp/none)" discord)
     builder_ch=$(ask "Builder agent channel (discord/telegram/none)" discord)
     asst_ch=$(ask "Assistant agent channel (telegram/discord/whatsapp/none)" telegram)
-    sed -e "s/^  name: Sam$/  name: ${name}/" \
+    sed -e "/^owner:/,/^[^ ]/ s/^  name: Sam$/  name: ${name}/" \
         -e "s|^  timezone: Europe/London$|  timezone: ${tz}|" \
         -e "s/^subscriptions: .*/subscriptions: [${subs}]/" \
         fleet.example.yaml > fleet.yaml
@@ -128,8 +141,32 @@ PY
   fi
 
   echo
+  bold "People"
+  echo "  By default only you can talk to the fleet, on your subscriptions."
+  echo "  Add teammates and they share it too; each can connect their own ChatGPT later."
+  local people
+  people=$(ask "Who else joins? Comma-separated names, or blank for just you" "")
+  if [ -n "$people" ]; then
+    python3 - "$people" <<'PY'
+import sys, re, pathlib
+names = [n.strip() for n in sys.argv[1].split(",") if n.strip()]
+lines = pathlib.Path("fleet.yaml").read_text().splitlines()
+out, inserted = [], False
+for line in lines:
+    out.append(line)
+    if line.startswith("people:") and not inserted:
+        inserted = True
+        for name in names:
+            pid = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))[:32]
+            out += [f"  - id: {pid}", f"    name: {name}"]
+pathlib.Path("fleet.yaml").write_text("\n".join(out) + "\n")
+PY
+    info "added to fleet.yaml. Fill in their chat IDs there, then ./fleet up"
+  fi
+
+  echo
   bold "Chat access"
-  echo "  Agents only answer you in DMs. Leave blank for platforms you don't use."
+  echo "  Agents only answer listed people in DMs. Leave blank for platforms you don't use."
   local v
   v=$(ask "Your Discord user ID (Settings → Advanced → Developer Mode, right-click yourself → Copy ID)" "$(grep '^OWNER_DISCORD_ID=' .env | cut -d= -f2-)")
   set_env OWNER_DISCORD_ID "$v"
@@ -204,7 +241,7 @@ cmd_login() {
       printf '%s' "$token" | compose exec -T openclaw sh -c \
         'umask 077; cat > /run/fleet-secrets/claude-oauth-token'
       printf '%s\n' "$token" | compose exec -T openclaw \
-        openclaw models auth paste-token --provider anthropic >/dev/null \
+        openclaw models auth paste-token --provider anthropic --profile-id anthropic:fleet >/dev/null \
         || warn "OpenClaw did not accept the token; agents still use it through the claude CLI"
       info "saved. Applying to every agent..."
       cmd_up >/dev/null
@@ -215,7 +252,8 @@ cmd_login() {
       bold "Connect your ChatGPT subscription"
       echo "  OpenClaw agents first, then each Hermes agent. Each shows a code to enter at the link."
       echo
-      compose exec -it openclaw openclaw models auth login --provider openai --device-code
+      compose exec -it openclaw openclaw models auth login --provider openai \
+        --device-code --profile-id openai:fleet
       for aid in $(fleet_query hermes); do
         echo; bold "Hermes agent: $aid"
         hermes_exec "$aid" auth add openai-codex
@@ -224,6 +262,31 @@ cmd_login() {
       ;;
     *) die "usage: ./fleet login claude|chatgpt" ;;
   esac
+}
+
+cmd_user() {
+  need_setup
+  local pid="${1:-}"
+  [ -n "$pid" ] || die "usage: ./fleet user <person-id>"
+  local name chan sid
+  name=$(fleet_query "person:$pid")
+  [ -n "$name" ] || die "no person called $pid in fleet.yaml"
+  bold "Connect $name's own ChatGPT subscription"
+  echo "  This bills $name's chats to their account instead of the fleet's."
+  echo "  Claude stays on the fleet's subscription."
+  echo
+  for chan in discord telegram whatsapp; do
+    sid=$(fleet_query "personid:$pid:$chan")
+    [ -n "$sid" ] || continue
+    info "$chan: $sid"
+    compose exec -it openclaw openclaw users link-channel \
+      --person "$pid" --channel "$chan" --sender "$sid" || true
+  done
+  echo
+  echo "  $name now opens the link and enters the code."
+  compose exec -it openclaw openclaw models accounts login openai \
+    --method device-code --person "$pid"
+  info "$name's new chats use their ChatGPT. Existing chats stay on the fleet's."
 }
 
 cmd_whatsapp() {
@@ -284,8 +347,9 @@ fleet: run your AI agent fleet
 
   setup                 answer a few questions; writes fleet.yaml and .env
   up                    start or apply changes to fleet.yaml / .env
-  login claude          connect a Claude Pro/Max subscription
-  login chatgpt         connect a ChatGPT Plus/Pro subscription
+  login claude          connect the fleet's Claude Pro/Max subscription
+  login chatgpt         connect the fleet's ChatGPT Plus/Pro subscription
+  user <person>         connect one person's own ChatGPT subscription
   whatsapp <agent>      pair WhatsApp for an agent (scan a QR code)
   pair <channel> <code> approve someone who messaged an agent
   status                what is running
@@ -307,6 +371,7 @@ case "${1:-help}" in
   status|ps) cmd_status ;;
   logs) need_setup; export_profiles; shift; compose logs -f --tail 100 "$@" ;;
   login) shift; cmd_login "$@" ;;
+  user) shift; cmd_user "$@" ;;
   whatsapp) shift; cmd_whatsapp "$@" ;;
   pair) shift; need_setup; compose exec -it openclaw openclaw pairing approve "$@" ;;
   ui) cmd_ui ;;

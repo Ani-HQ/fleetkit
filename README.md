@@ -73,6 +73,7 @@ fleet.yaml + .env
 - [Deploy to a cloud](docs/deploy.md)
 - [Connect subscriptions](docs/subscriptions.md)
 - [Connect Discord, Telegram, WhatsApp](docs/channels.md)
+- [Several people, one fleet](docs/people.md)
 - [Security](docs/security.md)
 - [Upgrading and backups](docs/upgrading.md)
 

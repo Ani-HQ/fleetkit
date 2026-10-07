@@ -12,7 +12,8 @@ Tokens go in `.env`, named after the agent id: `DISCORD_TOKEN_OPS`, `TELEGRAM_TO
 
 ## Who can talk to your agents
 
-Agents answer **you** in DMs. Set your IDs in `.env` (setup asks):
+Agents answer the people listed under `people` in `fleet.yaml`. With no list,
+they answer **you**. Set your IDs in `.env` (setup asks):
 
 - `OWNER_DISCORD_ID`: Discord → Settings → Advanced → Developer Mode on. Right-click your name → Copy User ID.
 - `OWNER_TELEGRAM_ID`: message [@userinfobot](https://t.me/userinfobot).
