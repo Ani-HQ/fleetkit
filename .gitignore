@@ -1,0 +1,5 @@
+.env
+fleet.yaml
+backups/
+*.log
+.DS_Store
