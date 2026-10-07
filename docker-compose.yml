@@ -1,0 +1,134 @@
+# fleetkit: an AI agent fleet in one `docker compose up`.
+#
+# Use `./fleet up` rather than calling compose directly; it validates
+# fleet.yaml, picks the memory profile and pulls or builds images first.
+#
+# Boot order:
+#   db → engram → engram-tokens (mint memory tokens, once)
+#      → init (render fleet.yaml into OpenClaw + Hermes config)
+#      → openclaw (gateway + session-warden + fleet board), hermes
+
+name: fleet
+
+x-fleet-image: &fleet-image
+  image: ghcr.io/ani-hq/fleetkit:${FLEETKIT_VERSION:-latest}
+  build:
+    context: ./images/fleet
+
+x-fleet-volumes: &fleet-volumes
+  - openclaw:/home/node/.openclaw
+  - hermes:/home/node/.hermes
+  - claude:/home/node/.claude
+  - warden:/opt/session-warden/state
+  - fleet-secrets:/run/fleet-secrets
+  - ./fleet.yaml:/etc/fleetkit/fleet.yaml:ro
+
+services:
+  init:
+    <<: *fleet-image
+    command: ["init"]
+    user: root
+    env_file: .env
+    volumes: *fleet-volumes
+    depends_on:
+      engram-tokens:
+        condition: service_completed_successfully
+        required: false
+    restart: "no"
+
+  openclaw:
+    <<: *fleet-image
+    command: ["gateway"]
+    env_file: .env
+    environment:
+      ENGRAM_HOST: http://engram:8080
+    volumes: *fleet-volumes
+    ports:
+      - "127.0.0.1:${OPENCLAW_PORT:-18789}:18789"
+      - "127.0.0.1:${FLEET_BOARD_PORT:-8090}:8090"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: false
+    stop_grace_period: 40s
+
+  hermes:
+    image: nousresearch/hermes-agent:${HERMES_VERSION:-v2026.9.24}
+    command: ["gateway", "run"]
+    environment:
+      # Same uid as the fleet image's `node` user, so both containers can read
+      # and write the shared Hermes volume.
+      HERMES_UID: "1000"
+      HERMES_GID: "1000"
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: admin
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_PASSWORD:?run ./fleet setup}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${OPENCLAW_GATEWAY_TOKEN:?run ./fleet setup}
+    volumes:
+      - hermes:/opt/data
+    ports:
+      - "127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  db:
+    image: pgvector/pgvector:pg16
+    profiles: [memory]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-engram}
+    volumes:
+      - engram-pg:/var/lib/postgresql/data
+      - ./images/engram/create-dbs.sql:/docker-entrypoint-initdb.d/create-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  engram:
+    image: ghcr.io/ani-hq/fleetkit-engram:${FLEETKIT_VERSION:-latest}
+    build:
+      context: ./images/engram
+    profiles: [memory]
+    environment: &engram-env
+      ENGRAM_DB_URL_TEMPLATE: postgresql://postgres:${POSTGRES_PASSWORD:-engram}@db:5432/__DB__
+      ENGRAM_PUBLIC_URL: http://127.0.0.1:${ENGRAM_PORT:-8080}
+    volumes:
+      - engram-homes:/gbrain-homes
+    ports:
+      - "127.0.0.1:${ENGRAM_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:8080/health');process.exit(r.ok?0:1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  engram-tokens:
+    image: ghcr.io/ani-hq/fleetkit-engram:${FLEETKIT_VERSION:-latest}
+    profiles: [memory]
+    entrypoint: ["/bin/sh", "/usr/local/bin/fleet-engram-tokens"]
+    environment: *engram-env
+    volumes:
+      - fleet-secrets:/run/fleet-secrets
+    depends_on:
+      engram:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  openclaw:
+  hermes:
+  claude:
+  warden:
+  fleet-secrets:
+  engram-pg:
+  engram-homes:

@@ -3,3 +3,4 @@ fleet.yaml
 backups/
 *.log
 .DS_Store
+__pycache__/

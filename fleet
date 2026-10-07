@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# fleet: run your AI agent fleet. `./fleet help` lists commands.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
+die() { printf 'fleet: %s\n' "$*" >&2; exit 1; }
+
+compose() { docker compose "$@"; }
+
+need_setup() {
+  [ -f .env ] && [ -f fleet.yaml ] || die "run ./fleet setup first"
+}
+
+memory_enabled() {
+  awk '/^memory:/{m=1;next} /^[^ #]/{m=0} m && /enabled:/{print $2; exit}' fleet.yaml |
+    grep -qv false
+}
+
+export_profiles() {
+  if memory_enabled; then export COMPOSE_PROFILES=memory; else export COMPOSE_PROFILES=; fi
+}
+
+# Ask fleet.yaml a question with the fleet image's own parser.
+fleet_query() {
+  compose run --rm --no-deps -T --entrypoint python3 openclaw -c "
+import yaml, sys
+f = yaml.safe_load(open('/etc/fleetkit/fleet.yaml'))
+agents = f.get('agents') or []
+q = sys.argv[1]
+if q == 'hermes':
+    print(' '.join(a['id'] for a in agents if a.get('harness') == 'hermes'))
+elif q.startswith('harness:'):
+    aid = q.split(':', 1)[1]
+    print(next((a.get('harness', '') for a in agents if a['id'] == aid), ''))
+" "$1"
+}
+
+# `hermes` CLI for one agent: the first Hermes agent is the default profile.
+hermes_exec() {
+  local aid="$1"; shift
+  local first; first=$(fleet_query hermes | awk '{print $1}')
+  if [ "$aid" = "$first" ]; then
+    compose exec -it -u hermes hermes hermes "$@"
+  else
+    compose exec -it -u hermes hermes hermes -p "$aid" "$@"
+  fi
+}
+
+ask() {
+  local prompt="$1" default="${2:-}" answer
+  if [ -n "$default" ]; then read -rp "  $prompt [$default]: " answer; else read -rp "  $prompt: " answer; fi
+  printf '%s' "${answer:-$default}"
+}
+
+ask_secret() {
+  local answer
+  read -rsp "  $1: " answer; echo >&2
+  printf '%s' "$answer"
+}
+
+set_env() {
+  local key="$1" value="$2"
+  if grep -q "^${key}=" .env; then
+    python3 - "$key" "$value" <<'PY'
+import sys, re, pathlib
+key, value = sys.argv[1], sys.argv[2]
+p = pathlib.Path(".env")
+p.write_text(re.sub(rf"^{re.escape(key)}=.*$", lambda _: f"{key}={value}", p.read_text(), flags=re.M))
+PY
+  else
+    printf '%s=%s\n' "$key" "$value" >> .env
+  fi
+}
+
+cmd_setup() {
+  command -v docker >/dev/null || die "Docker is not installed. On a fresh server, use install.sh."
+  bold "fleet setup"
+  echo "  Answers go to fleet.yaml (agents) and .env (secrets). Re-run any time."
+  echo
+
+  [ -f .env ] || cp .env.example .env
+  chmod 600 .env
+  for key in OPENCLAW_GATEWAY_TOKEN HERMES_DASHBOARD_PASSWORD POSTGRES_PASSWORD; do
+    grep -q "^${key}=." .env || set_env "$key" "$(openssl rand -hex 24)"
+  done
+
+  if [ -f fleet.yaml ] && [ "$(ask 'fleet.yaml exists. Keep it?' Y)" != "n" ]; then
+    info "keeping fleet.yaml"
+  else
+    local name tz subs claude chatgpt
+    name=$(ask "Your name" "$(id -un)")
+    tz=$(ask "Your timezone (IANA, e.g. Europe/London, Asia/Kolkata)" "UTC")
+    echo "  Which AI subscriptions do you have? (no API keys needed)"
+    claude=$(ask "  Claude Pro or Max? y/n" y)
+    chatgpt=$(ask "  ChatGPT Plus or Pro? y/n" y)
+    subs=""
+    [ "$claude" = y ] && subs="claude"
+    [ "$chatgpt" = y ] && subs="${subs:+$subs, }chatgpt"
+    [ -n "$subs" ] || die "you need at least one subscription"
+
+    echo "  Starter agents: ops + builder (OpenClaw), assistant (Hermes)."
+    local ops_ch builder_ch asst_ch
+    ops_ch=$(ask "Ops agent channel (discord/telegram/whatsapp/none)" discord)
+    builder_ch=$(ask "Builder agent channel (discord/telegram/none)" discord)
+    asst_ch=$(ask "Assistant agent channel (telegram/discord/whatsapp/none)" telegram)
+    sed -e "s/^  name: Sam$/  name: ${name}/" \
+        -e "s|^  timezone: Europe/London$|  timezone: ${tz}|" \
+        -e "s/^subscriptions: .*/subscriptions: [${subs}]/" \
+        fleet.example.yaml > fleet.yaml
+    python3 - "$ops_ch" "$builder_ch" "$asst_ch" <<'PY'
+import sys, pathlib
+chans = [("ops", sys.argv[1]), ("builder", sys.argv[2]), ("assistant", sys.argv[3])]
+p = pathlib.Path("fleet.yaml")
+lines, current = p.read_text().splitlines(), None
+for i, line in enumerate(lines):
+    if line.strip().startswith("- id: "):
+        current = line.split(":", 1)[1].strip()
+    elif line.strip().startswith("channels:") and current:
+        ch = dict(chans).get(current, "")
+        lines[i] = line.split("channels:")[0] + f"channels: [{'' if ch in ('', 'none') else ch}]"
+p.write_text("\n".join(lines) + "\n")
+PY
+    info "wrote fleet.yaml"
+  fi
+
+  echo
+  bold "Chat access"
+  echo "  Agents only answer you in DMs. Leave blank for platforms you don't use."
+  local v
+  v=$(ask "Your Discord user ID (Settings → Advanced → Developer Mode, right-click yourself → Copy ID)" "$(grep '^OWNER_DISCORD_ID=' .env | cut -d= -f2-)")
+  set_env OWNER_DISCORD_ID "$v"
+  v=$(ask "Your Telegram user ID (message @userinfobot)" "$(grep '^OWNER_TELEGRAM_ID=' .env | cut -d= -f2-)")
+  set_env OWNER_TELEGRAM_ID "$v"
+  v=$(ask "Your WhatsApp number, digits with country code" "$(grep '^OWNER_WHATSAPP_NUMBER=' .env | cut -d= -f2-)")
+  set_env OWNER_WHATSAPP_NUMBER "$v"
+
+  echo
+  bold "Bot tokens"
+  echo "  One bot per agent. Guides: docs/channels.md. Enter to keep the current value."
+  python3 - <<'PY' > .fleet-tokens
+import re, pathlib
+text = pathlib.Path("fleet.yaml").read_text()
+for block in re.split(r"\n\s*- id: ", text)[1:]:
+    aid = block.split("\n", 1)[0].strip()
+    m = re.search(r"channels:\s*\[(.*?)\]", block)
+    for ch in [c.strip() for c in (m.group(1) if m else "").split(",") if c.strip()]:
+        if ch in ("discord", "telegram"):
+            print(f"{ch.upper()}_TOKEN_{aid.upper().replace('-', '_')}")
+PY
+  while read -r key; do
+    v=$(ask_secret "$key")
+    [ -n "$v" ] && set_env "$key" "$v"
+  done < .fleet-tokens
+  rm -f .fleet-tokens
+
+  echo
+  bold "Next"
+  info "./fleet up               start the fleet"
+  info "./fleet login claude     connect your Claude subscription"
+  info "./fleet login chatgpt    connect your ChatGPT subscription"
+  info "./fleet whatsapp <agent> pair WhatsApp (if you chose it)"
+}
+
+cmd_up() {
+  need_setup
+  export_profiles
+  bold "starting the fleet"
+  if [ "${FLEET_BUILD:-}" = 1 ] || ! compose pull --quiet 2>/dev/null; then
+    info "building images locally (first time takes a few minutes)"
+    compose build
+  fi
+  compose up -d --remove-orphans
+  echo
+  cmd_status
+}
+
+cmd_status() {
+  need_setup
+  export_profiles
+  compose ps --format 'table {{.Service}}\t{{.Status}}'
+  echo
+  compose logs --no-log-prefix init 2>/dev/null | grep -E '^\[fleet-init\]' | tail -n 12 || true
+}
+
+cmd_login() {
+  need_setup
+  export_profiles
+  case "${1:-}" in
+    claude)
+      bold "Connect your Claude subscription"
+      echo "  1. Open the link below and approve."
+      echo "  2. Paste the code back here."
+      echo "  3. Claude prints a token starting with sk-ant-oat01-. Copy it."
+      echo
+      compose exec -it openclaw claude setup-token || true
+      echo
+      local token
+      token=$(ask_secret "Paste the sk-ant-oat01- token")
+      case "$token" in sk-ant-oat01-*) ;; *) die "that doesn't look like a Claude setup token" ;; esac
+      printf '%s' "$token" | compose exec -T openclaw sh -c \
+        'umask 077; cat > /run/fleet-secrets/claude-oauth-token'
+      printf '%s\n' "$token" | compose exec -T openclaw \
+        openclaw models auth paste-token --provider anthropic >/dev/null \
+        || warn "OpenClaw did not accept the token; agents still use it through the claude CLI"
+      info "saved. Applying to every agent..."
+      cmd_up >/dev/null
+      compose restart openclaw hermes >/dev/null
+      info "Claude connected."
+      ;;
+    chatgpt)
+      bold "Connect your ChatGPT subscription"
+      echo "  OpenClaw agents first, then each Hermes agent. Each shows a code to enter at the link."
+      echo
+      compose exec -it openclaw openclaw models auth login --provider openai --device-code
+      for aid in $(fleet_query hermes); do
+        echo; bold "Hermes agent: $aid"
+        hermes_exec "$aid" auth add openai-codex
+      done
+      info "ChatGPT connected."
+      ;;
+    *) die "usage: ./fleet login claude|chatgpt" ;;
+  esac
+}
+
+cmd_whatsapp() {
+  need_setup
+  local aid="${1:-}"
+  [ -n "$aid" ] || die "usage: ./fleet whatsapp <agent-id>"
+  echo "  On your phone: WhatsApp → Settings → Linked devices → Link a device, then scan."
+  case "$(fleet_query "harness:$aid")" in
+    openclaw) compose exec -it openclaw openclaw channels login --channel whatsapp --account "$aid" ;;
+    hermes) hermes_exec "$aid" whatsapp ;;
+    *) die "no agent called $aid in fleet.yaml" ;;
+  esac
+}
+
+cmd_ui() {
+  need_setup
+  local token host
+  token=$(grep '^OPENCLAW_GATEWAY_TOKEN=' .env | cut -d= -f2-)
+  host=$(hostname -I 2>/dev/null | awk '{print $1}')
+  bold "Dashboards (bound to localhost on the server)"
+  echo "  From your laptop, open a tunnel:"
+  echo "    ssh -L 18789:localhost:18789 -L 9119:localhost:9119 -L 8090:localhost:8090 -L 8080:localhost:8080 <user>@${host:-your-server}"
+  echo
+  echo "  OpenClaw Control UI   http://localhost:18789   token: $token"
+  echo "  Hermes dashboard      http://localhost:9119    user: admin  password: $(grep '^HERMES_DASHBOARD_PASSWORD=' .env | cut -d= -f2-)"
+  echo "  Fleet board           http://localhost:8090"
+  memory_enabled && echo "  Memory (engram)       http://localhost:8080"
+}
+
+cmd_update() {
+  need_setup
+  git pull --ff-only
+  cmd_up
+}
+
+cmd_backup() {
+  need_setup
+  export_profiles
+  local stamp out
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  out="backups/fleet-$stamp"
+  mkdir -p "$out"
+  cp fleet.yaml .env "$out/"
+  chmod 600 "$out/.env"
+  for vol in openclaw hermes claude warden fleet-secrets engram-homes; do
+    docker run --rm -v "fleet_${vol}:/v:ro" -v "$PWD/$out:/out" alpine \
+      tar -czf "/out/${vol}.tgz" -C /v . 2>/dev/null && info "saved $vol"
+  done
+  if memory_enabled; then
+    compose exec -T db pg_dumpall -U postgres | gzip > "$out/engram-db.sql.gz" && info "saved memory database"
+  fi
+  bold "backup written to $out"
+}
+
+cmd_help() {
+  cat <<'EOF'
+fleet: run your AI agent fleet
+
+  setup                 answer a few questions; writes fleet.yaml and .env
+  up                    start or apply changes to fleet.yaml / .env
+  login claude          connect a Claude Pro/Max subscription
+  login chatgpt         connect a ChatGPT Plus/Pro subscription
+  whatsapp <agent>      pair WhatsApp for an agent (scan a QR code)
+  pair <channel> <code> approve someone who messaged an agent
+  status                what is running
+  logs [service]        follow logs (openclaw, hermes, engram, init)
+  ui                    how to open the dashboards
+  update                pull the latest fleetkit and restart
+  backup                snapshot config, logins, sessions and memory
+  down                  stop everything (data is kept)
+
+  openclaw <args>       run the OpenClaw CLI inside the fleet
+  hermes <agent> <args> run the Hermes CLI for one agent
+EOF
+}
+
+case "${1:-help}" in
+  setup) cmd_setup ;;
+  up) cmd_up ;;
+  down) need_setup; export_profiles; compose down ;;
+  status|ps) cmd_status ;;
+  logs) need_setup; export_profiles; shift; compose logs -f --tail 100 "$@" ;;
+  login) shift; cmd_login "$@" ;;
+  whatsapp) shift; cmd_whatsapp "$@" ;;
+  pair) shift; need_setup; compose exec -it openclaw openclaw pairing approve "$@" ;;
+  ui) cmd_ui ;;
+  update) cmd_update ;;
+  backup) cmd_backup ;;
+  openclaw) shift; need_setup; compose exec -it openclaw openclaw "$@" ;;
+  hermes) shift; need_setup; aid="${1:?usage: ./fleet hermes <agent> <args>}"; shift; hermes_exec "$aid" "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help; exit 1 ;;
+esac

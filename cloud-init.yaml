@@ -1,0 +1,15 @@
+#cloud-config
+# Paste into "user data" when creating an Ubuntu server (Hetzner, DigitalOcean,
+# AWS, GCP, Oracle, Linode, Vultr...). It installs Docker and fleetkit for the
+# default user. Then SSH in and run: cd ~/fleetkit && ./fleet setup && ./fleet up
+package_update: true
+packages: [git, curl, openssl, python3, ca-certificates]
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+  - |
+    u=$(getent passwd 1000 | cut -d: -f1)
+    [ -n "$u" ] || u=root
+    [ "$u" = root ] || usermod -aG docker "$u"
+    h=$(getent passwd "$u" | cut -d: -f6)
+    sudo -u "$u" git clone --depth 1 https://github.com/Ani-HQ/fleetkit.git "$h/fleetkit"

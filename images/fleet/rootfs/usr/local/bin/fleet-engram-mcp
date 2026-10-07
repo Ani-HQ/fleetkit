@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# stdio MCP bridge to the fleet's engram server, for OpenClaw agents.
+set -euo pipefail
+token_file=/run/fleet-secrets/engram/openclaw.token
+if [ ! -s "$token_file" ]; then
+  echo "fleet-engram-mcp: no engram token yet (is memory enabled?)" >&2
+  exit 1
+fi
+export ENGRAM_HOST="${ENGRAM_HOST:-http://engram:8080}"
+ENGRAM_TOKEN="$(cat "$token_file")"
+export ENGRAM_TOKEN
+exec engram-mcp "$@"

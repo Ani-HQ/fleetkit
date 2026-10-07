@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck -S warning fleet install.sh \
+            images/fleet/rootfs/usr/local/bin/fleet-entrypoint \
+            images/fleet/rootfs/usr/local/bin/fleet-engram-mcp \
+            images/fleet/rootfs/usr/local/bin/systemctl \
+            images/engram/fleet-engram-tokens.sh
+      - name: fleet-init compiles
+        run: python3 -m py_compile images/fleet/rootfs/opt/fleetkit/bin/fleet-init
+      - name: compose config
+        run: |
+          cp .env.example .env
+          cp fleet.example.yaml fleet.yaml
+          sed -i 's/^OPENCLAW_GATEWAY_TOKEN=$/OPENCLAW_GATEWAY_TOKEN=ci/; s/^HERMES_DASHBOARD_PASSWORD=$/HERMES_DASHBOARD_PASSWORD=ci/' .env
+          COMPOSE_PROFILES=memory docker compose config --quiet
+
+  boot:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: boot the fleet
+        run: |
+          cp fleet.example.yaml fleet.yaml
+          cp .env.example .env
+          for k in OPENCLAW_GATEWAY_TOKEN HERMES_DASHBOARD_PASSWORD POSTGRES_PASSWORD; do
+            sed -i "s/^$k=\$/$k=$(openssl rand -hex 16)/" .env
+          done
+          export COMPOSE_PROFILES=memory
+          docker compose build
+          docker compose up -d
+      - name: wait for healthy gateway
+        run: |
+          export COMPOSE_PROFILES=memory
+          for i in $(seq 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' fleet-openclaw-1 2>/dev/null)" = healthy ] && break
+            sleep 5
+          done
+          docker compose ps -a
+          docker compose logs init
+          test "$(docker inspect -f '{{.State.ExitCode}}' fleet-init-1)" = 0
+          curl -fsS http://127.0.0.1:18789/ >/dev/null
+          curl -fsS http://127.0.0.1:8090/ >/dev/null
+          curl -fsS http://127.0.0.1:8080/health
+          test "$(docker inspect -f '{{.State.Status}}' fleet-hermes-1)" = running
+      - name: logs on failure
+        if: failure()
+        run: COMPOSE_PROFILES=memory docker compose logs --tail 200
