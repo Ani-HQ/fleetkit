@@ -1,0 +1,8 @@
+# Applied by `./fleet up` when TS_AUTHKEY is set.
+# Tailscale Serve is what tells the dashboard which person a browser belongs
+# to, and it proxies to the gateway's loopback, so the host port is dropped.
+services:
+  openclaw:
+    user: root
+    cap_add: ["NET_ADMIN"]
+    ports: !reset []

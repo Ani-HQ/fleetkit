@@ -46,6 +46,12 @@ If you only have one subscription, every agent uses it. To pin a model, set `mod
 
 The warden's nightly reflection and weekly review use Claude. With ChatGPT only, the warden still rotates sessions and guards rate limits, but those Claude jobs are skipped.
 
+## Several people
+
+Everyone listed under `people` in `fleet.yaml` shares these subscriptions. A
+person can connect their own ChatGPT on top, and their new chats bill that
+account instead. See [Several people, one fleet](people.md).
+
 ## Re-logging in
 
 Logins expire rarely. If an agent replies with an auth error, run the same `./fleet login` command again. To switch accounts: `./fleet openclaw models auth login --provider openai --device-code --force`.

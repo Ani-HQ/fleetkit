@@ -11,6 +11,7 @@ ARG SESSION_WARDEN_COMMIT=1f3c266f253119f8d8418f0d821a2a768834b3d0
 ARG SUPERCRONIC_VERSION=v0.2.49
 ARG SUPERCRONIC_SHA256_amd64=a53ae236602c7338aba3fbaff40bda6300eae3b9fedb8261eb06cfe3724430c1
 ARG SUPERCRONIC_SHA256_arm64=02aa0cb229ba09050cba6638059dadb9eedc2276632ea43d6a57a2f8c1629dd5
+ARG TAILSCALE_VERSION=1.102.5
 
 USER root
 
@@ -24,6 +25,16 @@ RUN set -eu; \
     "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}"; \
   echo "${sha}  /usr/local/bin/supercronic" | sha256sum -c -; \
   chmod +x /usr/local/bin/supercronic
+
+# Tailscale: per-person identity for the Control UI (who connects their own
+# subscription). The container joins the operator's tailnet via TS_AUTHKEY.
+RUN set -eu; \
+  curl -fsSL -o /tmp/tailscale.tgz \
+    "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_${TARGETARCH}.tgz"; \
+  tar -xzf /tmp/tailscale.tgz -C /tmp; \
+  install -m 755 "/tmp/tailscale_${TAILSCALE_VERSION}_${TARGETARCH}/tailscale" /usr/local/bin/tailscale; \
+  install -m 755 "/tmp/tailscale_${TAILSCALE_VERSION}_${TARGETARCH}/tailscaled" /usr/local/bin/tailscaled; \
+  rm -rf /tmp/tailscale*
 
 # Claude Code: the `claude-cli` runtime for Claude Pro/Max subscriptions, and
 # the summarizer session-warden uses. engram-mcp: stdio bridge to engram.

@@ -49,6 +49,15 @@ Default shape (leave out empty sections):
 Every message should make the reader's next action obvious. If there is none,
 ask whether the message should exist at all.
 
+## Whose account pays
+
+The fleet runs on shared subscriptions. A person who connected their own
+ChatGPT is billed on that account instead, for the chats they start. When
+someone asks which account a chat uses, tell them plainly: the fleet's, or
+theirs. Never ask anyone to paste a token or key into chat. Connecting an
+account happens in the Control UI, under Settings → Profile → Connected
+accounts.
+
 ## Long tasks
 
 Stay in the turn until the work is finished or you are blocked. Short one-line

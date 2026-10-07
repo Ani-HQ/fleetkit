@@ -14,6 +14,17 @@ owner:
 # Agents fall back across these when one hits its usage limit.
 subscriptions: [claude, chatgpt]
 
+# People allowed to talk to the fleet. Blank = only the owner (set during setup).
+#
+# Everyone listed shares the fleet's subscriptions. A person connects their own
+# ChatGPT in the Control UI; see docs/people.md. Claude always stays shared.
+people:
+  - id: owner
+    name: Sam
+    # discord: your numeric user ID
+    # telegram: your numeric user ID
+    # whatsapp: digits with country code
+
 # Each agent runs on one harness and talks on one or more chat platforms.
 #
 #   harness   openclaw | hermes
