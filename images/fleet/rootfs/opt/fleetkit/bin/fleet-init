@@ -83,6 +83,21 @@ def load_fleet():
         if "whatsapp" in chans and whatsapp.setdefault(agent["harness"], aid) != aid:
             die(f"only one {agent['harness']} agent can own WhatsApp")
 
+    people = fleet.setdefault("people", [])
+    if not people:
+        people.append({"id": "owner", "name": owner["name"]})
+    seen_people = set()
+    for person in people:
+        pid = str(person.get("id", ""))
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", pid):
+            die(f"person id {pid!r} must be lowercase letters, digits or dashes")
+        if pid in seen_people:
+            die(f"person id {pid!r} is duplicated")
+        seen_people.add(pid)
+        person.setdefault("name", pid.capitalize())
+        for chan in CHANNELS:
+            person.setdefault(chan, "")
+
     fleet.setdefault("defaults", {})
     fleet.setdefault("memory", {}).setdefault("enabled", True)
     fleet.setdefault("warden", {}).setdefault("enabled", True)
@@ -131,23 +146,32 @@ def env_ref(name):
     return {"source": "env", "provider": "default", "id": name}
 
 
-def channel_account(chan, aid):
+def people_on(people, chan):
+    """IDs of people allowed on one channel, from fleet.yaml with .env as fallback."""
+    env_var = {"discord": "OWNER_DISCORD_ID", "telegram": "OWNER_TELEGRAM_ID",
+               "whatsapp": "OWNER_WHATSAPP_NUMBER"}[chan]
+    ids = [str(p.get(chan) or "").lstrip("+") for p in people]
+    ids = [i for i in ids if i]
+    if not ids and len(people) == 1:
+        ids = [i for i in [os.environ.get(env_var, "").lstrip("+")] if i]
+    return [f"+{i}" if chan == "whatsapp" else i for i in ids]
+
+
+def channel_account(chan, aid, people):
     """Per-agent bot account for OpenClaw, or None if its token is missing."""
     if chan == "whatsapp":
-        number = os.environ.get("OWNER_WHATSAPP_NUMBER", "").lstrip("+")
-        account, owner = {}, (f"+{number}" if number else "")
+        account = {}
     else:
-        prefix, field, owner_var = {
-            "discord": ("DISCORD_TOKEN", "token", "OWNER_DISCORD_ID"),
-            "telegram": ("TELEGRAM_TOKEN", "botToken", "OWNER_TELEGRAM_ID"),
-        }[chan]
+        prefix, field = {"discord": ("DISCORD_TOKEN", "token"),
+                         "telegram": ("TELEGRAM_TOKEN", "botToken")}[chan]
         token = env_name(prefix, aid)
         if not os.environ.get(token):
             log(f"skip {chan} for {aid}: {token} is empty in .env")
             return None
-        account, owner = {field: env_ref(token)}, os.environ.get(owner_var, "")
-    if owner:
-        account.update(dmPolicy="allowlist", allowFrom=[owner])
+        account = {field: env_ref(token)}
+    allowed = people_on(people, chan)
+    if allowed:
+        account.update(dmPolicy="allowlist", allowFrom=allowed)
     else:
         account["dmPolicy"] = "pairing"
     return account
@@ -201,10 +225,17 @@ def setup_openclaw(fleet):
     write_once(OPENCLAW / "shared" / "COMMUNICATION.md", template("shared", "COMMUNICATION.md"))
 
     primary, fallbacks = model_chain({}, subs, ["claude", "chatgpt"])
+    tailscale = bool(os.environ.get("TS_AUTHKEY"))
     ops = [
-        {"path": "gateway.bind", "value": "lan"},
+        # Tailscale Serve proxies to loopback and is what carries per-person
+        # identity. Without it the dashboard is reached through the published port.
+        {"path": "gateway.bind", "value": "loopback" if tailscale else "lan"},
         {"path": "gateway.controlUi.allowedOrigins",
          "value": ["http://localhost:18789", "http://127.0.0.1:18789"]},
+        # People connect their own subscription in the Control UI. Tailscale
+        # Serve tells the gateway who each browser belongs to.
+        {"path": "gateway.tailscale.mode", "value": "serve" if tailscale else "off"},
+        {"path": "gateway.auth.allowTailscale", "value": tailscale},
         {"path": "agents.defaults.models",
          "value": {m: {"agentRuntime": {"id": RUNTIME[m.split("/")[0]]}}
                    for m in model_pool(subs, ["claude", "chatgpt"])}},
@@ -227,7 +258,7 @@ def setup_openclaw(fleet):
             {"path": f"agents.entries.{aid}.heartbeat", "value": heartbeat},
         ]
         for chan in agent["channels"]:
-            account = channel_account(chan, aid)
+            account = channel_account(chan, aid, fleet["people"])
             if account is None:
                 continue
             enabled.add(chan)
@@ -249,6 +280,11 @@ def setup_openclaw(fleet):
     if "whatsapp" in enabled and not (OPENCLAW / "extensions" / "whatsapp").exists():
         log("installing the OpenClaw WhatsApp plugin")
         openclaw("plugins", "install", "@openclaw/whatsapp", check=False)
+
+    # One shared auth profile per subscription, labelled so people can pick it in chat.
+    for sub in subs:
+        provider = {"claude": "anthropic", "chatgpt": "openai"}[sub]
+        ops.append({"path": f"auth.order.{provider}", "value": [f"{provider}:fleet"]})
 
     openclaw("config", "set", "--batch-json", json.dumps(ops))
     openclaw("config", "validate")
@@ -315,8 +351,7 @@ def setup_hermes(fleet):
                                      f"{template('shared', 'COMMUNICATION.md')}")
 
         env, chans = {}, agent["channels"]
-        for chan, prefix, owner_var in [("telegram", "TELEGRAM", "OWNER_TELEGRAM_ID"),
-                                        ("discord", "DISCORD", "OWNER_DISCORD_ID")]:
+        for chan, prefix in [("telegram", "TELEGRAM"), ("discord", "DISCORD")]:
             if chan not in chans:
                 continue
             token = os.environ.get(env_name(f"{prefix}_TOKEN", aid), "")
@@ -324,10 +359,10 @@ def setup_hermes(fleet):
                 log(f"skip {chan} for {aid}: {env_name(prefix + '_TOKEN', aid)} is empty in .env")
                 continue
             env[f"{prefix}_BOT_TOKEN"] = token
-            env[f"{prefix}_ALLOWED_USERS"] = os.environ.get(owner_var, "")
+            env[f"{prefix}_ALLOWED_USERS"] = ",".join(people_on(fleet["people"], chan))
         if "whatsapp" in chans:
             env.update(WHATSAPP_ENABLED="true", WHATSAPP_MODE="bot",
-                       WHATSAPP_ALLOWED_USERS=os.environ.get("OWNER_WHATSAPP_NUMBER", "").lstrip("+"))
+                       WHATSAPP_ALLOWED_USERS=",".join(people_on(fleet["people"], "whatsapp")))
         env["ENGRAM_TOKEN"] = engram_token
         if "claude" in subs:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
