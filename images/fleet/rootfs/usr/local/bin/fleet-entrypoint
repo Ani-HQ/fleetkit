@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# fleet-entrypoint: one image, three jobs.
+#   init      render fleet.yaml into OpenClaw + Hermes config, then exit
+#   gateway   run OpenClaw, with session-warden cron and the fleet board beside it
+#   <other>   pass through (e.g. `openclaw doctor`, `bash`)
+set -euo pipefail
+
+export TZ="${FLEET_TZ:-${TZ:-UTC}}"
+[ -f /run/fleet-secrets/fleet.env ] && set -a && . /run/fleet-secrets/fleet.env && set +a
+
+log() { printf '[fleet] %s\n' "$*" >&2; }
+
+# Restart a background helper forever; it must never take the gateway down.
+supervise() {
+  local name="$1"; shift
+  (
+    while true; do
+      "$@" || log "$name exited ($?), restarting in 10s"
+      sleep 10
+    done
+  ) &
+}
+
+case "${1:-gateway}" in
+  init)
+    # Runs as root once per boot: the Hermes image can seed the shared volume
+    # with its own uid before we get here, so hand every volume to node first.
+    if [ "$(id -u)" = 0 ]; then
+      chown -R node:node /home/node/.openclaw /home/node/.hermes /home/node/.claude \
+        /opt/session-warden/state /run/fleet-secrets
+      exec setpriv --reuid=node --regid=node --init-groups python3 /opt/fleetkit/bin/fleet-init
+    fi
+    exec python3 /opt/fleetkit/bin/fleet-init
+    ;;
+
+  gateway)
+    python3 /opt/fleetkit/bin/fleet-init --links-only || log "could not link Hermes homes"
+    [ -f /var/lib/fleet-board/index.html ] ||
+      printf '<p>Fleet board: first snapshot in about 10 minutes.</p>\n' > /var/lib/fleet-board/index.html
+    crontab="$HOME/.openclaw/fleetkit/crontab"
+    if [ -s "$crontab" ]; then
+      supervise warden supercronic -quiet "$crontab"
+      log "session-warden schedule loaded"
+    fi
+    supervise board python3 -m http.server 8090 --bind 0.0.0.0 \
+      --directory /var/lib/fleet-board
+    exec node /app/docker-entrypoint.mjs node /app/openclaw.mjs gateway
+    ;;
+
+  *)
+    exec "$@"
+    ;;
+esac
